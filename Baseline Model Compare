@@ -1,0 +1,1087 @@
+import os
+import cv2
+import re
+import random
+import pandas as pd
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import torchvision.transforms as transforms
+from sklearn.metrics import accuracy_score, f1_score, roc_curve, auc, precision_score, recall_score, roc_auc_score
+from sklearn.preprocessing import StandardScaler, OneHotEncoder
+from torch.utils.data import DataLoader, TensorDataset
+from imblearn.over_sampling import SMOTE
+import warnings
+import matplotlib.pyplot as plt
+from torchvision.models import resnet18, googlenet, vgg11
+from torchvision.models import ResNet18_Weights, GoogLeNet_Weights, VGG11_Weights
+import xgboost as xgb
+import lightgbm as lgb
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.linear_model import LogisticRegression
+from sklearn.tree import DecisionTreeClassifier
+from sklearn.model_selection import StratifiedShuffleSplit, StratifiedKFold
+from torch.optim.lr_scheduler import ReduceLROnPlateau, CosineAnnealingLR
+from scipy.spatial.distance import cdist
+
+SEED = 42
+def seed_everything(seed):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(seed)
+        torch.backends.cudnn.deterministic = True
+seed_everything(SEED)
+
+NUMERIC_FEATURES_PATH = r"D:\25summer\features_all_label.xlsx"
+TRAJECTORY_ROOT = r"D:\25summer\trajectory_images"
+HEATMAP_ROOT = r"D:\25summer\heatmap_images\original_images"
+LABEL_DATA_PATH = r"D:\25summer\data.xlsx"
+BASELINE_RESULT_PATH = r"D:\25summer\baseline_comparison_3class_optimized_v4.xlsx"
+CLASS_ROC_PLOT_PATH = r"D:\25summer\class_012_roc_curves_3class_optimized_v4.png"
+
+D_MODEL = 64
+N_HEADS = 2
+BASE_LR = 0.0005
+NUM_EPOCHS = 100
+BATCH_SIZE = 8
+SAMPLE_SEQUENCES = [1, 2, 3, 4]
+N_BOOTSTRAPS = 20
+TEST_SIZE = 0.25
+
+onehot_encoder = OneHotEncoder(sparse_output=False, categories='auto')
+
+class EfficientNetLite0(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.stem = nn.Sequential(
+            nn.Conv2d(3, 32, 3, 2, 1, bias=False),
+            nn.BatchNorm2d(32),
+            nn.ReLU6(inplace=True)
+        )
+        self.middle = nn.Sequential(
+            nn.Conv2d(32, 32, 3, 1, 1, groups=32, bias=False),
+            nn.BatchNorm2d(32),
+            nn.ReLU6(inplace=True),
+            nn.Conv2d(32, 128, 1, bias=False),
+            nn.BatchNorm2d(128)
+        )
+        self.head = nn.Sequential(
+            nn.Conv2d(128, 1280, 1, bias=False),
+            nn.BatchNorm2d(1280),
+            nn.ReLU6(inplace=True)
+        )
+        self.avg_pool = nn.AdaptiveAvgPool2d(1)
+
+    def forward(self, x):
+        x = self.stem(x)
+        x = self.middle(x)
+        x = self.head(x)
+        x = self.avg_pool(x)
+        return x.view(x.size(0), -1)
+
+class ResNet18FeatureExtractor(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.resnet18 = resnet18(weights=ResNet18_Weights.IMAGENET1K_V1).to(device)
+        self.resnet18 = nn.Sequential(*list(self.resnet18.children())[:-1])
+        self.eval()
+    def forward(self, x):
+        with torch.no_grad():
+            x = self.resnet18(x)
+        return x.view(x.size(0), -1)
+
+class GoogLeNetFeatureExtractor(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.googlenet = googlenet(weights=GoogLeNet_Weights.IMAGENET1K_V1).to(device)
+        self.googlenet = nn.Sequential(*list(self.googlenet.children())[:-1])
+        self.avg_pool = nn.AdaptiveAvgPool2d(1)
+        self.eval()
+    def forward(self, x):
+        with torch.no_grad():
+            x = self.googlenet(x)
+            x = self.avg_pool(x)
+        return x.view(x.size(0), -1)
+
+class VGG11FeatureExtractor(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.vgg11 = vgg11(weights=VGG11_Weights.IMAGENET1K_V1).to(device)
+        self.vgg11 = nn.Sequential(*list(self.vgg11.children())[:-1])
+        self.avg_pool = nn.AdaptiveAvgPool2d(1)
+        self.eval()
+    def forward(self, x):
+        with torch.no_grad():
+            x = self.vgg11(x)
+            x = self.avg_pool(x)
+        return x.view(x.size(0), -1)
+
+class SingleModalTransformer(nn.Module):
+    def __init__(self, img_feat_dim, output_dim, d_model=D_MODEL, n_heads=N_HEADS):
+        super().__init__()
+        self.embedding = nn.Linear(img_feat_dim, d_model)
+        self.pos_encoding = nn.Parameter(torch.randn(1, 3, d_model))
+        
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=d_model, nhead=n_heads, dim_feedforward=d_model*2,
+            dropout=0.3, activation='relu', batch_first=True
+        )
+        self.transformer_encoder = nn.TransformerEncoder(encoder_layer, num_layers=2)
+        
+        self.classifier = nn.Sequential(
+            nn.Linear(d_model, d_model),
+            nn.ReLU(),
+            nn.Dropout(0.4),
+            nn.Linear(d_model, output_dim)
+        )
+    
+    def forward(self, x, return_probs=False):
+        x = self.embedding(x) + self.pos_encoding
+        x = self.transformer_encoder(x)
+        x = x.mean(dim=1)
+        logits = self.classifier(x)
+        if return_probs:
+            return logits, torch.softmax(logits, dim=1)
+        return logits
+
+class SingleModalCNN(nn.Module):
+    def __init__(self, img_feat_dim, output_dim, d_model=D_MODEL):
+        super().__init__()
+        self.proj = nn.Linear(img_feat_dim * 3, d_model)
+        self.classifier = nn.Sequential(
+            nn.Linear(d_model, d_model),
+            nn.ReLU(),
+            nn.Dropout(0.4),
+            nn.Linear(d_model, output_dim)
+        )
+    
+    def forward(self, x, return_probs=False):
+        x = x.reshape(x.shape[0], -1)
+        x = self.proj(x)
+        logits = self.classifier(x)
+        if return_probs:
+            return logits, torch.softmax(logits, dim=1)
+        return logits
+
+class SingleModalMLP(nn.Module):
+    def __init__(self, num_feat_dim, output_dim, d_model=D_MODEL):
+        super().__init__()
+        self.classifier = nn.Sequential(
+            nn.Linear(num_feat_dim, d_model),
+            nn.ReLU(),
+            nn.Dropout(0.5),
+            nn.Linear(d_model, d_model),
+            nn.ReLU(),
+            nn.Dropout(0.5),
+            nn.Linear(d_model, output_dim)
+        )
+    
+    def forward(self, x, return_probs=False):
+        logits = self.classifier(x)
+        if return_probs:
+            return logits, torch.softmax(logits, dim=1)
+        return logits
+
+class SimpleFusionModel(nn.Module):
+    def __init__(self, img_feat_dim, num_feat_dim, output_dim, d_model=D_MODEL):
+        super().__init__()
+        self.traj_proj = nn.Sequential(
+            nn.Linear(img_feat_dim * 3, d_model),
+            nn.ReLU(),
+            nn.Dropout(0.3)
+        )
+        self.heat_proj = nn.Sequential(
+            nn.Linear(img_feat_dim * 3, d_model),
+            nn.ReLU(),
+            nn.Dropout(0.3)
+        )
+        self.num_proj = nn.Sequential(
+            nn.Linear(num_feat_dim, d_model),
+            nn.ReLU(),
+            nn.Dropout(0.4)
+        )
+        self.fusion = nn.Sequential(
+            nn.Linear(d_model * 3, d_model),
+            nn.ReLU(),
+            nn.Dropout(0.5)
+        )
+        self.classifier = nn.Linear(d_model, output_dim)
+    
+    def forward(self, traj, heat, num, return_probs=False):
+        traj_flat = traj.reshape(traj.shape[0], -1)
+        heat_flat = heat.reshape(heat.shape[0], -1)
+        t_emb = self.traj_proj(traj_flat)
+        h_emb = self.heat_proj(heat_flat)
+        n_emb = self.num_proj(num)
+        fusion = torch.cat([t_emb, h_emb, n_emb], dim=1)
+        fusion = self.fusion(fusion)
+        logits = self.classifier(fusion)
+        if return_probs:
+            return logits, torch.softmax(logits, dim=1)
+        return logits
+
+class SMOTEFusionModel(nn.Module):
+    def __init__(self, img_feat_dim, num_feat_dim, output_dim, d_model=D_MODEL):
+        super().__init__()
+        self.traj_proj = nn.Sequential(
+            nn.Linear(img_feat_dim, d_model),
+            nn.ReLU(),
+            nn.Dropout(0.3)
+        )
+        self.heat_proj = nn.Sequential(
+            nn.Linear(img_feat_dim, d_model),
+            nn.ReLU(),
+            nn.Dropout(0.3)
+        )
+        self.num_proj = nn.Sequential(
+            nn.Linear(num_feat_dim, d_model), 
+            nn.ReLU(),
+            nn.Dropout(0.4)
+        )
+        
+        self.pos_encoding = nn.Parameter(torch.randn(1, 3, d_model))
+        
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=d_model, nhead=N_HEADS, dim_feedforward=d_model*2,
+            dropout=0.3, activation='relu', batch_first=True
+        )
+        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=2)
+        
+        self.attention = nn.Sequential(
+            nn.Linear(d_model, d_model),
+            nn.Tanh(),
+            nn.Linear(d_model, 1)
+        )
+        
+        self.classifier = nn.Sequential(
+            nn.Linear(d_model, d_model),
+            nn.ReLU(),
+            nn.Dropout(0.5),
+            nn.Linear(d_model, output_dim)
+        )
+
+    def forward(self, traj, heat, num, return_probs=False):
+        batch_size = traj.shape[0]
+        
+        traj_reshaped = traj.reshape(-1, traj.shape[-1])
+        traj_projected = self.traj_proj(traj_reshaped)
+        traj_emb = traj_projected.reshape(batch_size, 3, -1) + self.pos_encoding
+        
+        heat_reshaped = heat.reshape(-1, heat.shape[-1])
+        heat_projected = self.heat_proj(heat_reshaped)
+        heat_emb = heat_projected.reshape(batch_size, 3, -1) + self.pos_encoding
+        
+        num_emb = self.num_proj(num)
+        num_emb = num_emb.unsqueeze(1).repeat(1, 3, 1)
+        
+        all_emb = torch.cat([traj_emb, heat_emb, num_emb], dim=1)
+        
+        trans_feat = self.transformer(all_emb)
+        
+        attn_weights = torch.softmax(self.attention(trans_feat), dim=1)
+        fused_feat = torch.sum(attn_weights * trans_feat, dim=1)
+        
+        logits = self.classifier(fused_feat)
+        if return_probs:
+            return logits, torch.softmax(logits, dim=1)
+        return logits
+
+def get_model_feature_extractor(model_name):
+    extractor_map = {
+        "RandomForest": EfficientNetLite0().to(device).eval(),
+        "LogisticRegression": EfficientNetLite0().to(device).eval(),
+        "DecisionTree": EfficientNetLite0().to(device).eval(),
+        "XGBoost": EfficientNetLite0().to(device).eval(),
+        "LightGBM": EfficientNetLite0().to(device).eval(),
+        "traj_cnn": EfficientNetLite0().to(device).eval(),
+        "heat_cnn": EfficientNetLite0().to(device).eval(),
+        "num_mlp": EfficientNetLite0().to(device).eval(),
+        "transformer": EfficientNetLite0().to(device).eval(),
+        "resnet18": ResNet18FeatureExtractor(),
+        "googlenet": GoogLeNetFeatureExtractor(),
+        "vgg11": VGG11FeatureExtractor(),
+        "simple_fusion": EfficientNetLite0().to(device).eval(),
+        "main_model": EfficientNetLite0().to(device).eval()
+    }
+    feat_dim_map = {
+        "RandomForest": 1280,
+        "LogisticRegression": 1280,
+        "DecisionTree": 1280,
+        "XGBoost": 1280,
+        "LightGBM": 1280,
+        "traj_cnn": 1280, "heat_cnn": 1280,
+        "num_mlp": 1280,
+        "transformer": 1280,
+        "resnet18": 512,
+        "googlenet": 1024,
+        "vgg11": 512,
+        "simple_fusion": 1280, "main_model": 1280
+    }
+    return extractor_map[model_name], feat_dim_map[model_name]
+
+def get_paradigm_features(images, extractor, model_name):
+    if len(images) == 0:
+        _, feat_dim = get_model_feature_extractor(model_name)
+        return np.zeros(feat_dim, dtype=np.float32)
+    
+    preprocess = transforms.Compose([
+        transforms.ToPILImage(),
+        transforms.Resize((224, 224)),
+        transforms.ToTensor(),
+        transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
+    ])
+    
+    features_list = []
+    for img in images:
+        tensor = preprocess(cv2.cvtColor(img, cv2.COLOR_BGR2RGB)).unsqueeze(0).to(device)
+        with torch.no_grad():
+            feat = extractor(tensor).cpu().numpy()[0]
+        features_list.append(feat)
+    
+    if len(features_list) == 0:
+        _, feat_dim = get_model_feature_extractor(model_name)
+        return np.zeros(feat_dim, dtype=np.float32)
+    
+    return np.mean(features_list, axis=0)
+
+def load_images_by_paradigm_and_sequence(root_dir, recording):
+    PARADIGMS = {"paradigm1": "YANSHEN+TOU+SHOU", "paradigm2": "YANSHEN+TOU", "paradigm3": "YANSHEN"}
+    data = {seq: {p: [] for p in PARADIGMS.keys()} for seq in SAMPLE_SEQUENCES}
+    path = os.path.join(root_dir, recording)
+    if os.path.exists(path):
+        for f in os.listdir(path):
+            m = re.search(r'([1-4])', f)
+            s_num = int(m.group(1)) if m else None
+            if s_num in SAMPLE_SEQUENCES:
+                img = cv2.imread(os.path.join(path, f))
+                if img is not None:
+                    img = cv2.resize(img, (224, 224))
+                    for p_n, p_k in PARADIGMS.items():
+                        if p_k in f: data[s_num][p_n].append(img)
+    return data
+
+def train_ml_model(X_train, y_train, X_test, y_test, model_name, output_dim):
+    scaler = StandardScaler()
+    X_train_scaled = scaler.fit_transform(X_train)
+    X_test_scaled = scaler.transform(X_test)
+    
+    if model_name == "RandomForest":
+        model = RandomForestClassifier(
+            n_estimators=150,
+            max_depth=10,
+            min_samples_split=5,
+            min_samples_leaf=2,
+            random_state=SEED,
+            class_weight='balanced',
+            n_jobs=-1
+        )
+    elif model_name == "LogisticRegression":
+        model = LogisticRegression(
+            max_iter=1000, 
+            random_state=SEED, 
+            multi_class='multinomial',
+            solver='lbfgs',
+            C=0.5,
+            class_weight='balanced'
+        )
+    elif model_name == "DecisionTree":
+        model = DecisionTreeClassifier(
+            random_state=SEED, 
+            max_depth=10,
+            min_samples_split=10,
+            min_samples_leaf=5,
+            class_weight='balanced'
+        )
+    elif model_name == "XGBoost":
+        model = xgb.XGBClassifier(
+            random_state=SEED, 
+            n_estimators=100,
+            max_depth=4,
+            learning_rate=0.03,
+            subsample=0.6,
+            colsample_bytree=0.6,
+            objective='multi:softprob', 
+            num_class=output_dim,
+            eval_metric='mlogloss',
+            use_label_encoder=False,
+            reg_alpha=0.1,
+            reg_lambda=1.0,
+            n_jobs=-1,
+            min_child_weight=2,
+            gamma=0.1,
+        )
+    elif model_name == "LightGBM":
+        model = lgb.LGBMClassifier(
+            random_state=SEED, 
+            n_estimators=100,
+            max_depth=4,
+            learning_rate=0.03,
+            subsample=0.6,
+            colsample_bytree=0.6,
+            objective='multiclass', 
+            num_class=output_dim,
+            verbose=-1,
+            class_weight='balanced',
+            reg_alpha=0.1,
+            reg_lambda=1.0,
+            min_child_samples=10,
+            min_split_gain=0.01,
+            n_jobs=-1
+        )
+    else:
+        raise ValueError(f"Unknown ML model: {model_name}")
+    
+    model.fit(X_train_scaled, y_train)
+    y_pred = model.predict(X_test_scaled)
+    y_probs = model.predict_proba(X_test_scaled)
+    
+    acc = accuracy_score(y_test, y_pred)
+    prec = precision_score(y_test, y_pred, average='weighted', zero_division=0)
+    rec = recall_score(y_test, y_pred, average='macro', zero_division=0)
+    f1 = f1_score(y_test, y_pred, average='weighted', zero_division=0)
+    
+    try:
+        if len(np.unique(y_test)) > 1:
+            auc_score = roc_auc_score(y_test, y_probs, multi_class='ovr', average='weighted')
+        else:
+            auc_score = 0.5
+    except:
+        auc_score = 0.5
+    
+    return acc, prec, rec, f1, auc_score, y_pred, y_probs, [], [], [], []
+
+class EarlyStopping:
+    def __init__(self, patience=15, delta=0.001):
+        self.patience = patience
+        self.delta = delta
+        self.counter = 0
+        self.best_score = None
+        self.early_stop = False
+        
+    def __call__(self, val_score):
+        if self.best_score is None:
+            self.best_score = val_score
+        elif val_score < self.best_score + self.delta:
+            self.counter += 1
+            if self.counter >= self.patience:
+                self.early_stop = True
+        else:
+            self.best_score = val_score
+            self.counter = 0
+        return self.early_stop
+
+def train_deep_model(model, train_loader, test_data, output_dim, model_type):
+    if model_type in ["traj_cnn", "heat_cnn", "transformer", "resnet18", "googlenet", "vgg11"]:
+        train_labels = train_loader.dataset.tensors[1]
+    elif model_type == "num_mlp":
+        train_labels = train_loader.dataset.tensors[1]
+    elif model_type in ["simple_fusion", "main_model"]:
+        train_labels = train_loader.dataset.tensors[3]
+    
+    class_counts = torch.bincount(train_labels)
+    class_weights = len(train_labels) / (len(class_counts) * class_counts.float())
+    class_weights = class_weights.to(device)
+    
+    optimizer = optim.AdamW(model.parameters(), lr=BASE_LR, weight_decay=1e-2)
+    scheduler = CosineAnnealingLR(optimizer, T_max=NUM_EPOCHS, eta_min=1e-6)
+    criterion = nn.CrossEntropyLoss(weight=class_weights)
+    
+    early_stopping = EarlyStopping(patience=15, delta=0.001)
+    best_f1 = 0
+    best_preds = []
+    best_probs = []
+    train_accs, train_losses, val_accs, val_losses = [], [], [], []
+    
+    for epoch in range(NUM_EPOCHS):
+        model.train()
+        epoch_loss, batch_count, correct, total = 0.0, 0, 0, 0
+        
+        for batch in train_loader:
+            optimizer.zero_grad()
+            
+            if model_type in ["traj_cnn", "heat_cnn", "transformer", "resnet18", "googlenet", "vgg11"]:
+                x, y = batch[0].to(device), batch[1].to(device)
+                logits, probs = model(x, return_probs=True)
+            elif model_type == "num_mlp":
+                x, y = batch[0].to(device), batch[1].to(device)
+                logits, probs = model(x, return_probs=True)
+            elif model_type in ["simple_fusion", "main_model"]:
+                traj, heat, num, y = batch[0].to(device), batch[1].to(device), batch[2].to(device), batch[3].to(device)
+                logits, probs = model(traj, heat, num, return_probs=True)
+            
+            loss = criterion(logits, y)
+            loss.backward()
+            
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            optimizer.step()
+            
+            preds = logits.argmax(1)
+            correct += (preds == y).sum().item()
+            total += y.size(0)
+            epoch_loss += loss.item()
+            batch_count += 1
+        
+        if batch_count == 0:
+            continue
+            
+        train_acc = correct / total
+        train_loss = epoch_loss / batch_count
+        train_accs.append(train_acc)
+        train_losses.append(train_loss)
+        
+        model.eval()
+        with torch.no_grad():
+            if model_type in ["traj_cnn", "heat_cnn", "transformer", "resnet18", "googlenet", "vgg11"]:
+                v_x = test_data[0].to(device)
+                v_y = test_data[1]
+                logits, probs = model(v_x, return_probs=True)
+            elif model_type == "num_mlp":
+                v_x = test_data[0].to(device)
+                v_y = test_data[1]
+                logits, probs = model(v_x, return_probs=True)
+            elif model_type in ["simple_fusion", "main_model"]:
+                v_t, v_h, v_n = test_data[0].to(device), test_data[1].to(device), test_data[2].to(device)
+                v_y = test_data[3]
+                logits, probs = model(v_t, v_h, v_n, return_probs=True)
+            
+            preds = logits.argmax(1).cpu().numpy()
+            val_acc = accuracy_score(v_y, preds)
+            val_loss = criterion(logits, torch.tensor(v_y, dtype=torch.long).to(device)).item()
+            current_f1 = f1_score(v_y, preds, average='weighted', zero_division=0)
+            
+            val_accs.append(val_acc)
+            val_losses.append(val_loss)
+            
+            if current_f1 > best_f1:
+                best_f1 = current_f1
+                best_preds = preds
+                best_probs = probs.cpu().numpy()
+        
+        scheduler.step()
+        
+        if early_stopping(-current_f1):
+            print(f"    Early stopping at epoch {epoch+1}")
+            break
+    
+    if len(test_data[-1]) > 0 and len(best_preds) > 0:
+        acc = accuracy_score(test_data[-1], best_preds)
+        prec = precision_score(test_data[-1], best_preds, average='weighted', zero_division=0)
+        rec = recall_score(test_data[-1], best_preds, average='macro', zero_division=0)
+        f1 = best_f1
+        
+        try:
+            if len(np.unique(test_data[-1])) > 1:
+                auc_score = roc_auc_score(test_data[-1], best_probs, multi_class='ovr', average='weighted')
+            else:
+                auc_score = 0.5
+        except:
+            auc_score = 0.5
+    else:
+        acc, prec, rec, f1, auc_score = 0, 0, 0, 0, 0
+        
+    return acc, prec, rec, f1, auc_score, best_preds, best_probs, train_accs, train_losses, val_accs, val_losses
+
+def calculate_multiclass_roc(y_true, y_probs, n_classes):
+    unique_classes = np.unique(y_true)
+    if len(unique_classes) < 2:
+        fpr = {i: np.array([]) for i in range(n_classes)}
+        tpr = {i: np.array([]) for i in range(n_classes)}
+        roc_auc = {i: np.nan for i in range(n_classes)}
+        fpr["micro"] = np.array([])
+        tpr["micro"] = np.array([])
+        roc_auc["micro"] = np.nan
+        return fpr, tpr, roc_auc
+    
+    onehot_encoder = OneHotEncoder(sparse_output=False, categories=[np.arange(n_classes)])
+    y_true_onehot = onehot_encoder.fit_transform(y_true.reshape(-1, 1))
+    
+    fpr, tpr, roc_auc = {}, {}, {}
+    for i in range(n_classes):
+        try:
+            if i not in unique_classes:
+                fpr[i] = np.array([])
+                tpr[i] = np.array([])
+                roc_auc[i] = np.nan
+                continue
+            fpr[i], tpr[i], _ = roc_curve(y_true_onehot[:, i], y_probs[:, i])
+            roc_auc[i] = auc(fpr[i], tpr[i])
+        except:
+            fpr[i] = np.array([])
+            tpr[i] = np.array([])
+            roc_auc[i] = np.nan
+    
+    try:
+        fpr["micro"], tpr["micro"], _ = roc_curve(y_true_onehot.ravel(), y_probs.ravel())
+        roc_auc["micro"] = auc(fpr["micro"], tpr["micro"])
+    except:
+        fpr["micro"] = np.array([])
+        tpr["micro"] = np.array([])
+        roc_auc["micro"] = np.nan
+    
+    return fpr, tpr, roc_auc
+
+def stratified_group_bootstrap_split_improved(X, y, groups, n_splits=N_BOOTSTRAPS, test_size=TEST_SIZE, random_state=42):
+    np.random.seed(random_state)
+    unique_groups = np.unique(groups)
+    unique_labels = np.unique(y)
+    
+    label2groups = {lbl: np.unique(groups[y == lbl]) for lbl in unique_labels}
+    
+    for split_idx in range(n_splits):
+        bootstrap_groups = []
+        
+        for lbl in unique_labels:
+            lbl_groups = label2groups[lbl]
+            if len(lbl_groups) >= 3:
+                n_train_groups = max(2, int(len(lbl_groups) * 0.7))
+                boot_lbl_groups = np.random.choice(lbl_groups, size=n_train_groups, replace=True)
+                bootstrap_groups.extend(boot_lbl_groups)
+            else:
+                bootstrap_groups.extend(lbl_groups)
+        
+        bootstrap_groups = np.unique(bootstrap_groups)
+        
+        train_mask = np.isin(groups, bootstrap_groups)
+        train_idx = np.where(train_mask)[0]
+        test_idx = np.where(~train_mask)[0]
+        
+        n_samples = len(X)
+        desired_test_size = int(n_samples * test_size)
+        
+        if len(test_idx) < desired_test_size * 0.5:
+            additional_test = np.random.choice(
+                train_idx, 
+                size=min(desired_test_size - len(test_idx), len(train_idx)//2), 
+                replace=False
+            )
+            test_idx = np.unique(np.concatenate([test_idx, additional_test]))
+            train_idx = np.setdiff1d(train_idx, additional_test)
+        
+        elif len(test_idx) > desired_test_size * 1.5:
+            keep_test = np.random.choice(
+                test_idx,
+                size=desired_test_size,
+                replace=False
+            )
+            move_to_train = np.setdiff1d(test_idx, keep_test)
+            test_idx = keep_test
+            train_idx = np.unique(np.concatenate([train_idx, move_to_train]))
+        
+        if len(train_idx) == 0 or len(test_idx) == 0:
+            sss = StratifiedShuffleSplit(n_splits=1, test_size=test_size, random_state=random_state+split_idx)
+            for t_idx, te_idx in sss.split(X, y):
+                train_idx, test_idx = t_idx, te_idx
+                break
+        
+        yield train_idx, test_idx
+
+def plot_class_roc_curves(models_metrics, output_dim, class_names):
+    plt.rcParams['font.sans-serif'] = ['Arial', 'DejaVu Sans']
+    plt.rcParams['axes.unicode_minus'] = False
+    
+    if len(models_metrics) > 0:
+        fig3, axes = plt.subplots(1, min(3, output_dim), figsize=(6*min(3, output_dim), 5), dpi=300)
+        if output_dim == 1:
+            axes = [axes]
+        
+        fig3.suptitle('Class-Wise ROC Curves', fontsize=20, fontweight='bold', y=1.02)
+        
+        colors = plt.cm.tab20(np.linspace(0, 1, len(models_metrics)))
+        
+        for cls_idx in range(min(3, output_dim)):
+            ax = axes[cls_idx] if output_dim > 1 else axes
+            
+            for idx, (model_name, (_, _, _, _, fpr, tpr, roc_auc)) in enumerate(models_metrics.items()):
+                color = colors[idx % len(colors)]
+                
+                if cls_idx in fpr and len(fpr[cls_idx]) > 0 and not np.isnan(roc_auc.get(cls_idx, np.nan)):
+                    ax.plot(fpr[cls_idx], tpr[cls_idx], color=color, linewidth=2,
+                           label=f'{model_name} (AUC={roc_auc[cls_idx]:.3f})', alpha=0.8)
+            
+            ax.plot([0, 1], [0, 1], 'k--', linewidth=2, alpha=0.7, label='Random Guess')
+            ax.set_xlabel('False Positive Rate (FPR)', fontsize=14, fontweight='bold')
+            ax.set_ylabel('True Positive Rate (TPR)', fontsize=14, fontweight='bold')
+            ax.set_title(f'{class_names[cls_idx]} ROC Curve', fontsize=16, fontweight='bold', pad=20)
+            ax.set_xlim([0.0, 1.0])
+            ax.set_ylim([0.0, 1.05])
+            ax.grid(True, alpha=0.3, linestyle='-')
+            ax.legend(loc='lower right', fontsize=8, framealpha=0.9)
+        
+        plt.tight_layout()
+        plt.savefig(CLASS_ROC_PLOT_PATH, bbox_inches='tight', dpi=300)
+        plt.show()
+        print(f"Class-wise ROC curves saved to: {CLASS_ROC_PLOT_PATH}")
+
+def main_baseline_comparison_optimized():
+    labels_df = pd.read_excel(LABEL_DATA_PATH, sheet_name="Common Pre-test Data Quality Assurance")
+    original_labels_dict = {str(row.iloc[0]).strip(): int(row.iloc[3]) for _, row in labels_df.iterrows() if pd.notna(row.iloc[3])}
+    
+    output_dim = 3
+    class_names = ["Class 0", "Class 1", "Class 2"]
+    print(f"Number of classes: {output_dim}, Class names: {class_names}")
+    
+    num_df = pd.read_excel(NUMERIC_FEATURES_PATH).fillna(0)
+    num_feat_dict = {str(row.iloc[0]).strip(): row.iloc[2:11].values.astype(np.float32) for _, row in num_df.iterrows()}
+    valid_subjs = [s for s in original_labels_dict.keys() if s in num_feat_dict]
+    print(f"Number of valid samples: {len(valid_subjs)}")
+    
+    label_counts = {}
+    for subj_id in valid_subjs:
+        label = original_labels_dict[subj_id]
+        label_counts[label] = label_counts.get(label, 0) + 1
+    print(f"Class distribution: {label_counts}")
+    
+    model_types = [
+        "RandomForest", "LogisticRegression", "DecisionTree", "XGBoost", "LightGBM",
+        "transformer", "resnet18", "googlenet", "vgg11",
+        "traj_cnn", "heat_cnn", "num_mlp",
+        "simple_fusion", "main_model"
+    ]
+    
+    baseline_results = {
+        "Model": [],
+        "Accuracy_mean": [],
+        "Accuracy_std": [],
+        "Precision_mean": [],
+        "Precision_std": [],
+        "Recall_mean": [],
+        "Recall_std": [],
+        "F1_mean": [],
+        "F1_std": [],
+        "AUC_mean": [],
+        "AUC_std": []
+    }
+    
+    models_metrics = {}
+    
+    for model_idx, model_name in enumerate(model_types):
+        print(f"\n{'='*60}")
+        print(f"Start training model ({model_idx+1}/{len(model_types)}): {model_name}")
+        print(f"{'='*60}")
+        
+        extractor, img_feat_dim = get_model_feature_extractor(model_name)
+        bt_acc, bt_prec, bt_rec, bt_f1, bt_auc = [], [], [], [], []
+        bt_all_preds, bt_all_probs, bt_all_true = [], [], []
+        bt_train_accs, bt_train_losses, bt_val_accs, bt_val_losses = [], [], [], []
+        
+        subjects_data, groups = [], []
+        for subj_id in valid_subjs:
+            t_imgs = load_images_by_paradigm_and_sequence(TRAJECTORY_ROOT, subj_id)
+            h_imgs = load_images_by_paradigm_and_sequence(HEATMAP_ROOT, subj_id)
+            label = original_labels_dict[subj_id]
+            
+            for seq in SAMPLE_SEQUENCES:
+                t_f = np.array([get_paradigm_features(t_imgs[seq][p], extractor, model_name) for p in ["paradigm1", "paradigm2", "paradigm3"]])
+                h_f = np.array([get_paradigm_features(h_imgs[seq][p], extractor, model_name) for p in ["paradigm1", "paradigm2", "paradigm3"]])
+                subjects_data.append({"traj": t_f, "heat": h_f, "num": num_feat_dict[subj_id], "label": label})
+                groups.append(subj_id)
+        
+        if len(subjects_data) == 0:
+            print(f"Warning: No data extracted for model {model_name}")
+            continue
+        
+        aug_array = np.array(subjects_data, dtype=object)
+        y_all = np.array([d["label"] for d in subjects_data])
+        groups = np.array(groups)
+        
+        unique, counts = np.unique(y_all, return_counts=True)
+        print(f"  Total samples: {len(y_all)}, Class distribution: {dict(zip(unique, counts))}")
+        print(f"  Number of unique subjects: {len(np.unique(groups))}")
+        
+        print(f"  Start improved Bootstrap validation, iterations: {N_BOOTSTRAPS}")
+        
+        bootstrap_generator = stratified_group_bootstrap_split_improved(
+            aug_array, y_all, groups, n_splits=N_BOOTSTRAPS, 
+            test_size=TEST_SIZE, random_state=SEED
+        )
+        
+        for bt_iter, (train_idx, test_idx) in enumerate(bootstrap_generator):
+            if (bt_iter + 1) % 5 == 0:
+                print(f"    Bootstrap iteration {bt_iter+1}/{N_BOOTSTRAPS} in progress")
+            
+            if len(train_idx) == 0 or len(test_idx) == 0:
+                continue
+                
+            train_data, test_data = aug_array[train_idx], aug_array[test_idx]
+            train_y, test_y = y_all[train_idx], y_all[test_idx]
+            bt_all_true.extend(test_y)
+            
+            train_traj = np.array([d["traj"] for d in train_data])
+            train_heat = np.array([d["heat"] for d in train_data])
+            train_num = np.array([d["num"] for d in train_data])
+            test_traj = np.array([d["traj"] for d in test_data])
+            test_heat = np.array([d["heat"] for d in test_data])
+            test_num = np.array([d["num"] for d in test_data])
+            
+            if model_name not in ["RandomForest", "LogisticRegression", "DecisionTree", "XGBoost", "LightGBM"]:
+                scaler = StandardScaler()
+                train_num_scaled = scaler.fit_transform(train_num)
+                test_num_scaled = scaler.transform(test_num)
+                
+                try:
+                    if len(np.unique(train_y)) >= 2:
+                        smote = SMOTE(random_state=SEED + bt_iter, sampling_strategy='auto')
+                        res_num_scaled, res_y = smote.fit_resample(train_num_scaled, train_y)
+                        
+                        if len(res_num_scaled) > len(train_num_scaled):
+                            distances = cdist(res_num_scaled[len(train_num_scaled):], train_num_scaled)
+                            nearest_indices = np.argmin(distances, axis=1)
+                            
+                            res_traj = np.concatenate([
+                                train_traj,
+                                train_traj[nearest_indices]
+                            ], axis=0)
+                            res_heat = np.concatenate([
+                                train_heat,
+                                train_heat[nearest_indices]
+                            ], axis=0)
+                        else:
+                            res_traj = train_traj
+                            res_heat = train_heat
+                            res_num_scaled = train_num_scaled
+                            res_y = train_y
+                    else:
+                        res_traj = train_traj
+                        res_heat = train_heat
+                        res_num_scaled = train_num_scaled
+                        res_y = train_y
+                except Exception as e:
+                    print(f"    SMOTE failed: {e}")
+                    res_traj = train_traj
+                    res_heat = train_heat
+                    res_num_scaled = train_num_scaled
+                    res_y = train_y
+            else:
+                train_all_feat = np.concatenate([
+                    train_traj.reshape(len(train_idx), -1),
+                    train_heat.reshape(len(train_idx), -1), 
+                    train_num
+                ], axis=1)
+                test_all_feat = np.concatenate([
+                    test_traj.reshape(len(test_idx), -1),
+                    test_heat.reshape(len(test_idx), -1), 
+                    test_num
+                ], axis=1)
+            
+            if model_name in ["RandomForest", "LogisticRegression", "DecisionTree", "XGBoost", "LightGBM"]:
+                if len(train_y) == 0 or len(test_y) == 0:
+                    continue
+                
+                acc, prec, rec, f1, auc_score, preds, probs, tr_acc, tr_loss, val_acc, val_loss = train_ml_model(
+                    train_all_feat, train_y, test_all_feat, test_y, model_name, output_dim
+                )
+                
+            else:
+                if len(res_y) == 0 or len(test_y) == 0:
+                    continue
+                
+                if model_name == "transformer":
+                    model = SingleModalTransformer(img_feat_dim, output_dim).to(device)
+                    train_loader = DataLoader(
+                        TensorDataset(torch.FloatTensor(res_traj), torch.LongTensor(res_y)), 
+                        batch_size=min(BATCH_SIZE, len(res_y)), 
+                        shuffle=True,
+                        drop_last=len(res_y) > BATCH_SIZE
+                    )
+                    test_input = (torch.FloatTensor(test_traj), test_y)
+                    
+                elif model_name in ["resnet18", "googlenet", "vgg11", "traj_cnn"]:
+                    model = SingleModalCNN(img_feat_dim, output_dim).to(device)
+                    train_loader = DataLoader(
+                        TensorDataset(torch.FloatTensor(res_traj), torch.LongTensor(res_y)), 
+                        batch_size=min(BATCH_SIZE, len(res_y)), 
+                        shuffle=True,
+                        drop_last=len(res_y) > BATCH_SIZE
+                    )
+                    test_input = (torch.FloatTensor(test_traj), test_y)
+                    
+                elif model_name == "heat_cnn":
+                    model = SingleModalCNN(img_feat_dim, output_dim).to(device)
+                    train_loader = DataLoader(
+                        TensorDataset(torch.FloatTensor(res_heat), torch.LongTensor(res_y)), 
+                        batch_size=min(BATCH_SIZE, len(res_y)), 
+                        shuffle=True,
+                        drop_last=len(res_y) > BATCH_SIZE
+                    )
+                    test_input = (torch.FloatTensor(test_heat), test_y)
+                    
+                elif model_name == "num_mlp":
+                    model = SingleModalMLP(9, output_dim).to(device)
+                    train_loader = DataLoader(
+                        TensorDataset(torch.FloatTensor(res_num_scaled), torch.LongTensor(res_y)), 
+                        batch_size=min(BATCH_SIZE, len(res_y)), 
+                        shuffle=True,
+                        drop_last=len(res_y) > BATCH_SIZE
+                    )
+                    test_input = (torch.FloatTensor(test_num_scaled), test_y)
+                    
+                elif model_name == "simple_fusion":
+                    model = SimpleFusionModel(img_feat_dim, 9, output_dim).to(device)
+                    train_loader = DataLoader(
+                        TensorDataset(
+                            torch.FloatTensor(res_traj), 
+                            torch.FloatTensor(res_heat),
+                            torch.FloatTensor(res_num_scaled), 
+                            torch.LongTensor(res_y)
+                        ), 
+                        batch_size=min(BATCH_SIZE, len(res_y)), 
+                        shuffle=True,
+                        drop_last=len(res_y) > BATCH_SIZE
+                    )
+                    test_input = (
+                        torch.FloatTensor(test_traj), 
+                        torch.FloatTensor(test_heat), 
+                        torch.FloatTensor(test_num_scaled), 
+                        test_y
+                    )
+                    
+                elif model_name == "main_model":
+                    model = SMOTEFusionModel(img_feat_dim, 9, output_dim).to(device)
+                    train_loader = DataLoader(
+                        TensorDataset(
+                            torch.FloatTensor(res_traj), 
+                            torch.FloatTensor(res_heat),
+                            torch.FloatTensor(res_num_scaled), 
+                            torch.LongTensor(res_y)
+                        ), 
+                        batch_size=min(BATCH_SIZE, len(res_y)), 
+                        shuffle=True,
+                        drop_last=len(res_y) > BATCH_SIZE
+                    )
+                    test_input = (
+                        torch.FloatTensor(test_traj), 
+                        torch.FloatTensor(test_heat), 
+                        torch.FloatTensor(test_num_scaled), 
+                        test_y
+                    )
+                
+                acc, prec, rec, f1, auc_score, preds, probs, tr_acc, tr_loss, val_acc, val_loss = train_deep_model(
+                    model, train_loader, test_input, output_dim, model_name
+                )
+            
+            bt_acc.append(acc)
+            bt_prec.append(prec)
+            bt_rec.append(rec)
+            bt_f1.append(f1)
+            bt_auc.append(auc_score)
+            bt_all_preds.extend(preds)
+            if probs is not None and len(probs) > 0:
+                bt_all_probs.extend(probs)
+            
+            if len(tr_acc) > 0:
+                max_len = min(NUM_EPOCHS, len(tr_acc))
+                tr_acc_padded = tr_acc[:max_len]
+                tr_loss_padded = tr_loss[:max_len]
+                val_acc_padded = val_acc[:max_len]
+                val_loss_padded = val_loss[:max_len]
+                
+                if len(tr_acc_padded) < NUM_EPOCHS:
+                    tr_acc_padded = tr_acc_padded + [tr_acc_padded[-1]] * (NUM_EPOCHS - len(tr_acc_padded))
+                    tr_loss_padded = tr_loss_padded + [tr_loss_padded[-1]] * (NUM_EPOCHS - len(tr_loss_padded))
+                    val_acc_padded = val_acc_padded + [val_acc_padded[-1]] * (NUM_EPOCHS - len(val_acc_padded))
+                    val_loss_padded = val_loss_padded + [val_loss_padded[-1]] * (NUM_EPOCHS - len(val_loss_padded))
+                
+                bt_train_accs.append(tr_acc_padded)
+                bt_train_losses.append(tr_loss_padded)
+                bt_val_accs.append(val_acc_padded)
+                bt_val_losses.append(val_loss_padded)
+        
+        if len(bt_acc) > 0:
+            avg_acc = np.mean(bt_acc)
+            avg_prec = np.mean(bt_prec)
+            avg_rec = np.mean(bt_rec)
+            avg_f1 = np.mean(bt_f1)
+            avg_auc = np.mean(bt_auc)
+            
+            std_acc = np.std(bt_acc)
+            std_prec = np.std(bt_prec)
+            std_rec = np.std(bt_rec)
+            std_f1 = np.std(bt_f1)
+            std_auc = np.std(bt_auc)
+            
+            print(f"  Bootstrap validation results (valid iterations: {len(bt_acc)}):")
+            print(f"    Accuracy: {avg_acc:.4f} ± {std_acc:.4f}")
+            print(f"    Precision: {avg_prec:.4f} ± {std_prec:.4f}")
+            print(f"    Macro Recall: {avg_rec:.4f} ± {std_rec:.4f}")
+            print(f"    F1-Score: {avg_f1:.4f} ± {std_f1:.4f}")
+            print(f"    AUC: {avg_auc:.4f} ± {std_auc:.4f}")
+        else:
+            avg_acc = avg_prec = avg_rec = avg_f1 = avg_auc = 0.0
+            std_acc = std_prec = std_rec = std_f1 = std_auc = 0.0
+            print(f"  Warning: No valid Bootstrap iterations for model {model_name}")
+        
+        baseline_results["Model"].append(model_name)
+        baseline_results["Accuracy_mean"].append(avg_acc)
+        baseline_results["Accuracy_std"].append(std_acc)
+        baseline_results["Precision_mean"].append(avg_prec)
+        baseline_results["Precision_std"].append(std_prec)
+        baseline_results["Recall_mean"].append(avg_rec)
+        baseline_results["Recall_std"].append(std_rec)
+        baseline_results["F1_mean"].append(avg_f1)
+        baseline_results["F1_std"].append(std_f1)
+        baseline_results["AUC_mean"].append(avg_auc)
+        baseline_results["AUC_std"].append(std_auc)
+        
+        if len(bt_train_accs) > 0:
+            min_len = min(len(arr) for arr in bt_train_accs if len(arr) > 0)
+            bt_train_accs_aligned = [arr[:min_len] for arr in bt_train_accs if len(arr) >= min_len]
+            bt_train_losses_aligned = [arr[:min_len] for arr in bt_train_losses if len(arr) >= min_len]
+            bt_val_accs_aligned = [arr[:min_len] for arr in bt_val_accs if len(arr) >= min_len]
+            bt_val_losses_aligned = [arr[:min_len] for arr in bt_val_losses if len(arr) >= min_len]
+            
+            if bt_train_accs_aligned:
+                avg_train_accs = np.mean(bt_train_accs_aligned, axis=0)
+                avg_train_losses = np.mean(bt_train_losses_aligned, axis=0)
+                avg_val_accs = np.mean(bt_val_accs_aligned, axis=0)
+                avg_val_losses = np.mean(bt_val_losses_aligned, axis=0)
+            else:
+                avg_train_accs, avg_train_losses, avg_val_accs, avg_val_losses = [], [], [], []
+        else:
+            avg_train_accs, avg_train_losses, avg_val_accs, avg_val_losses = [], [], [], []
+        
+        if len(bt_all_true) > 0 and len(bt_all_probs) > 0:
+            all_probs_array = np.array(bt_all_probs)
+            all_true_array = np.array(bt_all_true)
+            global_fpr, global_tpr, global_roc_auc = calculate_multiclass_roc(all_true_array, all_probs_array, output_dim)
+        else:
+            global_fpr, global_tpr, global_roc_auc = {}, {}, {}
+        
+        models_metrics[model_name] = (
+            avg_train_accs, avg_train_losses, avg_val_accs, avg_val_losses, 
+            global_fpr, global_tpr, global_roc_auc
+        )
+    
+    results_df = pd.DataFrame(baseline_results).round(4)
+    results_df.to_excel(BASELINE_RESULT_PATH, index=False)
+    print(f"\nBootstrap validation results for all models saved to: {BASELINE_RESULT_PATH}")
+    
+    plot_class_roc_curves(models_metrics, output_dim, class_names)
+    
+    print("\n" + "="*80)
+    print("Final Bootstrap validation comparison results for all models")
+    print("="*80)
+    print(results_df)
+    
+    if "F1_mean" in results_df.columns:
+        sorted_df = results_df.sort_values(by="F1_mean", ascending=False)
+        print("\n" + "="*80)
+        print("Model performance sorted by F1-Score")
+        print("="*80)
+        print(sorted_df[["Model", "Accuracy_mean", "Accuracy_std", "Precision_mean", "Precision_std", 
+                         "Recall_mean", "Recall_std", "F1_mean", "F1_std", 
+                         "AUC_mean", "AUC_std"]])
+        
+        if len(sorted_df) > 0:
+            best_model = sorted_df.iloc[0]
+            print(f"\nBest model: {best_model['Model']}")
+            print(f"  Accuracy: {best_model['Accuracy_mean']:.4f} ± {best_model['Accuracy_std']:.4f}")
+            print(f"  Precision: {best_model['Precision_mean']:.4f} ± {best_model['Precision_std']:.4f}")
+            print(f"  Macro Recall: {best_model['Recall_mean']:.4f} ± {best_model['Recall_std']:.4f}")
+            print(f"  F1-Score: {best_model['F1_mean']:.4f} ± {best_model['F1_std']:.4f}")
+            print(f"  AUC: {best_model['AUC_mean']:.4f} ± {best_model['AUC_std']:.4f}")
+
+if __name__ == "__main__":
+    main_baseline_comparison_optimized()
