@@ -17,9 +17,6 @@ import warnings
 import matplotlib.pyplot as plt
 import seaborn as sns
 
-warnings.filterwarnings('ignore')
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
 SEED = 42
 def seed_everything(seed):
     random.seed(seed)
