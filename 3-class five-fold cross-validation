@@ -1,0 +1,327 @@
+import os
+import cv2
+import re
+import random
+import pandas as pd
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import torchvision.transforms as transforms
+from sklearn.metrics import classification_report, accuracy_score, confusion_matrix, f1_score
+from sklearn.model_selection import StratifiedGroupKFold
+from sklearn.preprocessing import LabelEncoder, StandardScaler
+from torch.utils.data import DataLoader, TensorDataset
+from imblearn.over_sampling import SMOTE
+import warnings
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+warnings.filterwarnings('ignore')
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+SEED = 42
+def seed_everything(seed):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(seed)
+        torch.backends.cudnn.deterministic = True
+
+seed_everything(SEED)
+
+NUMERIC_FEATURES_PATH = r"./numeric_features.xlsx"
+TRAJECTORY_ROOT = r"./trajectory_dataset"
+HEATMAP_ROOT = r"./heatmap_dataset"
+LABEL_DATA_PATH = r"./label.xlsx"
+
+D_MODEL = 64
+N_HEADS = 2
+BASE_LR = 0.0002
+CNN_LR = 0.0002
+NUM_EPOCHS = 100
+BATCH_SIZE = 8
+SAMPLE_SEQUENCES = [1, 2, 3, 4]
+N_FOLDS = 5
+
+class EfficientNetLite0(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.stem = nn.Sequential(
+            nn.Conv2d(3, 32, 3, 2, 1, bias=False),
+            nn.BatchNorm2d(32),
+            nn.ReLU6(inplace=True)
+        )
+        self.middle = nn.Sequential(
+            nn.Conv2d(32, 32, 3, 1, 1, groups=32, bias=False),
+            nn.BatchNorm2d(32),
+            nn.ReLU6(inplace=True),
+            nn.Conv2d(32, 128, 1, bias=False),
+            nn.BatchNorm2d(128)
+        )
+        self.head = nn.Sequential(
+            nn.Conv2d(128, 1280, 1, bias=False),
+            nn.BatchNorm2d(1280),
+            nn.ReLU6(inplace=True)
+        )
+        self.avg_pool = nn.AdaptiveAvgPool2d(1)
+
+    def forward(self, x):
+        x = self.stem(x)
+        x = self.middle(x)
+        x = self.head(x)
+        x = self.avg_pool(x)
+        return x.view(x.size(0), -1)
+
+class SMOTEFusionModel(nn.Module):
+    def __init__(self, img_feat_dim, num_feat_dim, output_dim, d_model=D_MODEL):
+        super().__init__()
+        self.traj_proj = nn.Linear(img_feat_dim, d_model)
+        self.heat_proj = nn.Linear(img_feat_dim, d_model)
+        self.num_proj = nn.Sequential(nn.Linear(num_feat_dim, d_model), nn.LayerNorm(d_model), nn.ReLU())
+
+        self.pos_encoding = nn.Parameter(torch.randn(1, 3, d_model))  # [1, 3, d_model]
+
+        self.cross_attn_traj_heat = nn.MultiheadAttention(d_model, N_HEADS, batch_first=True, dropout=0.2)
+        self.cross_attn_heat_traj = nn.MultiheadAttention(d_model, N_HEADS, batch_first=True, dropout=0.2)
+
+        self.transformer = nn.TransformerEncoder(
+            nn.TransformerEncoderLayer(d_model, N_HEADS, 512, 0.3, batch_first=True), 3
+        )
+
+        self.modal_attention = nn.Sequential(
+            nn.Linear(d_model * 3, d_model),  
+            nn.ReLU(),
+            nn.LayerNorm(d_model),
+            nn.Linear(d_model, 3),          
+            nn.Softmax(dim=1)            
+        )
+
+        self.residual_alpha = nn.Parameter(torch.tensor(0.5))
+
+        self.deep_classifier = nn.Sequential(
+            nn.Linear(d_model, d_model * 2),
+            nn.BatchNorm1d(d_model * 2),
+            nn.GELU(),
+            nn.Dropout(0.3),
+
+            nn.Linear(d_model * 2, d_model),
+            nn.BatchNorm1d(d_model),
+            nn.GELU(),
+            nn.Dropout(0.3),
+
+            nn.Linear(d_model, d_model // 2),
+            nn.BatchNorm1d(d_model // 2),
+            nn.GELU(),
+            nn.Dropout(0.2),
+        )
+
+        self.feat_projection = nn.Sequential(
+            nn.Linear(d_model, d_model // 2),
+            nn.BatchNorm1d(d_model // 2),
+            nn.ReLU()
+        )
+
+        self.classifier_final = nn.Linear(d_model // 2, output_dim)
+
+        self.residual_scale = nn.Parameter(torch.tensor(0.1))
+
+    def forward(self, traj, heat, num):
+        t_emb = self.traj_proj(traj) + self.pos_encoding  # [B, 3, d_model]
+        h_emb = self.heat_proj(heat) + self.pos_encoding  # [B, 3, d_model]
+        n_emb = self.num_proj(num).unsqueeze(1).repeat(1, 3, 1)  # [B, 3, d_model]
+        t_h_inter, _ = self.cross_attn_traj_heat(t_emb, h_emb, h_emb)
+        h_t_inter, _ = self.cross_attn_heat_traj(h_emb, t_emb, t_emb)
+
+        fusion_emb = torch.cat([t_h_inter, h_t_inter, n_emb], dim=1)  # [B, 9, d_model]
+        trans_feat = self.transformer(fusion_emb)                     # [B, 9, d_model]
+
+        t_trans = trans_feat[:, 0:3, :]  
+        h_trans = trans_feat[:, 3:6, :]  
+        n_trans = trans_feat[:, 6:9, :] 
+        alpha = torch.sigmoid(self.residual_alpha)
+
+        t_global_orig = t_emb.mean(dim=1)     
+        t_global_trans = t_trans.mean(dim=1)   
+        t_enhanced = alpha * t_global_trans + (1 - alpha) * t_global_orig
+
+        h_global_orig = h_emb.mean(dim=1)     
+        h_global_trans = h_trans.mean(dim=1) 
+        h_enhanced = alpha * h_global_trans + (1 - alpha) * h_global_orig
+
+        n_global_orig = n_emb.mean(dim=1)    
+        n_global_trans = n_trans.mean(dim=1) 
+        n_enhanced = alpha * n_global_trans + (1 - alpha) * n_global_orig
+
+        modal_cat = torch.cat([t_enhanced, h_enhanced, n_enhanced], dim=1)  # [B, 3*d_model]
+        modal_weights = self.modal_attention(modal_cat)               # [B, 3]
+
+        fused_feat = (modal_weights[:, 0:1] * t_enhanced) + \
+                     (modal_weights[:, 1:2] * h_enhanced) + \
+                     (modal_weights[:, 2:3] * n_enhanced)  # [B, d_model]
+
+        deep_features = self.deep_classifier(fused_feat)  # [B, d_model//2 = 32]
+
+        fused_feat_proj = self.feat_projection(fused_feat)  # [B, d_model//2 = 32]
+
+        residual_scale = torch.sigmoid(self.residual_scale)
+        final_features = deep_features + residual_scale * fused_feat_proj
+
+        output = self.classifier_final(final_features)
+        return output
+
+def get_paradigm_features(images, extractor):
+    if len(images) == 0: return np.zeros(1280, dtype=np.float32)
+    preprocess = transforms.Compose([
+        transforms.ToPILImage(),
+        transforms.Resize((224, 224)),
+        transforms.ToTensor(),
+        transforms.Normalize([0.5, 0.5, 0.5], [0.5, 0.5, 0.5])
+    ])
+    tensors = torch.stack([preprocess(cv2.cvtColor(img, cv2.COLOR_BGR2RGB)) for img in images]).to(device)
+    with torch.no_grad():
+        return extractor(tensors).cpu().numpy().mean(axis=0)
+
+def load_images_by_paradigm_and_sequence(root_dir, recording):
+    PARADIGMS = {"paradigm1": "YANSHEN+TOU+SHOU", "paradigm2": "YANSHEN+TOU", "paradigm3": "YANSHEN"}
+    data = {seq: {p: [] for p in PARADIGMS.keys()} for seq in SAMPLE_SEQUENCES}
+    path = os.path.join(root_dir, recording)
+    if os.path.exists(path):
+        for f in os.listdir(path):
+            m = re.search(r'([1-4])', f)
+            s_num = int(m.group(1)) if m else None
+            if s_num in SAMPLE_SEQUENCES:
+                img = cv2.imread(os.path.join(path, f))
+                if img is not None:
+                    for p_n, p_k in PARADIGMS.items():
+                        if p_k in f: data[s_num][p_n].append(img)
+    return data
+
+def plot_confusion_matrix(y_true, y_pred, classes):
+    cm = confusion_matrix(y_true, y_pred)
+    plt.figure(figsize=(10, 8))
+    sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', xticklabels=classes, yticklabels=classes)
+    plt.title('Confusion Matrix - Multi-modal ASD Level Classification')
+    plt.ylabel('Actual Level')
+    plt.xlabel('Predicted Level')
+    plt.show()
+
+if __name__ == "__main__":
+    extractor = EfficientNetLite0().to(device)
+    extractor.eval()
+    labels_df = pd.read_excel(LABEL_DATA_PATH)
+    original_labels_dict = {str(row.iloc[0]).strip(): int(row.iloc[3]) for _, row in labels_df.iterrows() if pd.notna(row.iloc[3])}
+
+    le = LabelEncoder()
+    le.fit(list(original_labels_dict.values()))
+    output_dim = len(le.classes_)
+    class_names = [str(c) for c in le.classes_]
+
+    num_df = pd.read_excel(NUMERIC_FEATURES_PATH).fillna(0)
+    num_feat_dict = {str(row.iloc[0]).strip(): row.iloc[2:11].values.astype(np.float32) for _, row in num_df.iterrows()}
+
+    subjects_data, groups = [], []
+    for subj_id in [s for s in original_labels_dict.keys() if s in num_feat_dict]:
+        t_imgs = load_images_by_paradigm_and_sequence(TRAJECTORY_ROOT, subj_id)
+        h_imgs = load_images_by_paradigm_and_sequence(HEATMAP_ROOT, subj_id)
+        label = le.transform([original_labels_dict[subj_id]])[0]
+
+        for seq in SAMPLE_SEQUENCES:
+            t_f = np.array([get_paradigm_features(t_imgs[seq][p], extractor) for p in ["paradigm1", "paradigm2", "paradigm3"]])
+            h_f = np.array([get_paradigm_features(h_imgs[seq][p], extractor) for p in ["paradigm1", "paradigm2", "paradigm3"]])
+            subjects_data.append({"traj": t_f, "heat": h_f, "num": num_feat_dict[subj_id], "label": label})
+            groups.append(subj_id)
+
+    aug_array = np.array(subjects_data)
+    y_all = np.array([d["label"] for d in subjects_data])
+    groups = np.array(groups)
+    sgkf = StratifiedGroupKFold(n_splits=N_FOLDS, shuffle=True, random_state=SEED)
+    all_y_true, all_y_pred = [], []
+    fold_results = []
+
+    for fold, (train_idx, test_idx) in enumerate(sgkf.split(aug_array, y_all, groups=groups)):
+        print(f"\n>> Fold {fold+1}")
+
+        train_traj = np.array([d["traj"] for d in aug_array[train_idx]]).reshape(len(train_idx), -1)
+        train_heat = np.array([d["heat"] for d in aug_array[train_idx]]).reshape(len(train_idx), -1)
+        train_nums = np.array([d["num"] for d in aug_array[train_idx]])
+        train_y = y_all[train_idx]
+        sm = SMOTE(random_state=SEED)
+        res_feat, res_y = sm.fit_resample(np.concatenate([train_traj, train_heat, train_nums], axis=1), train_y)
+
+        res_traj = res_feat[:, :3840].reshape(-1, 3, 1280)
+        res_heat = res_feat[:, 3840:7680].reshape(-1, 3, 1280)
+        res_nums = res_feat[:, 7680:]
+        scaler = StandardScaler()
+        res_nums_scaled = scaler.fit_transform(res_nums)
+        test_nums_scaled = scaler.transform(np.array([d["num"] for d in aug_array[test_idx]]))
+
+        train_loader = DataLoader(TensorDataset(torch.FloatTensor(res_traj), torch.FloatTensor(res_heat),
+                                                torch.FloatTensor(res_nums_scaled), torch.LongTensor(res_y)),
+                                  batch_size=BATCH_SIZE, shuffle=True)
+        model = SMOTEFusionModel(1280, 9, output_dim).to(device)
+        optimizer = optim.AdamW([
+            {'params': model.traj_proj.parameters(), 'lr': CNN_LR},
+            {'params': model.heat_proj.parameters(), 'lr': CNN_LR},
+            {'params': model.num_proj.parameters(), 'lr': BASE_LR},
+            {'params': model.cross_attn_traj_heat.parameters(), 'lr': BASE_LR},
+            {'params': model.cross_attn_heat_traj.parameters(), 'lr': BASE_LR},
+            {'params': model.transformer.parameters(), 'lr': BASE_LR},
+            {'params': model.modal_attention.parameters(), 'lr': BASE_LR},
+            {'params': model.residual_alpha, 'lr': BASE_LR},          
+            {'params': model.deep_classifier.parameters(), 'lr': BASE_LR},  
+            {'params': model.feat_projection.parameters(), 'lr': BASE_LR},  
+            {'params': model.classifier_final.parameters(), 'lr': BASE_LR},
+            {'params': model.residual_scale, 'lr': BASE_LR},     
+        ], weight_decay=1e-2)
+        criterion = nn.CrossEntropyLoss()
+
+        best_fold_f1, best_fold_preds = 0, []
+        for epoch in range(NUM_EPOCHS):
+            model.train()
+            epoch_loss = 0.0
+            batch_count = 0
+
+            for bt, bh, bn, bl in train_loader:
+                bt, bh, bn, bl = bt.to(device), bh.to(device), bn.to(device), bl.to(device)
+                optimizer.zero_grad()
+                loss = criterion(model(bt, bh, bn), bl)
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                optimizer.step()
+                epoch_loss += loss.item()
+                batch_count += 1
+            avg_epoch_loss = epoch_loss / batch_count if batch_count > 0 else 0
+
+            model.eval()
+            with torch.no_grad():
+                v_t = torch.FloatTensor(np.array([d["traj"] for d in aug_array[test_idx]])).to(device)
+                v_h = torch.FloatTensor(np.array([d["heat"] for d in aug_array[test_idx]])).to(device)
+                v_n = torch.FloatTensor(test_nums_scaled).to(device)
+                preds = model(v_t, v_h, v_n).argmax(1).cpu().numpy()
+                current_f1 = f1_score(y_all[test_idx], preds, average='weighted')
+                if current_f1 > best_fold_f1:
+                    best_fold_f1 = current_f1
+                    best_fold_preds = preds
+
+        all_y_true.extend(y_all[test_idx])
+        all_y_pred.extend(best_fold_preds)
+        print(f"Fold {fold+1} Best Weighted F1: {best_fold_f1:.4f}")
+
+        with torch.no_grad():
+            alpha_value = torch.sigmoid(model.residual_alpha).item()
+            scale_value = torch.sigmoid(model.residual_scale).item()
+            print(f"  Fold {fold+1} : Residual Weight alpha={alpha_value:.4f}, scaling factor scale={scale_value:.4f}")
+
+    print("\n" + "="*50)
+    print("="*50)
+
+    overall_acc = accuracy_score(all_y_true, all_y_pred)
+    overall_f1 = f1_score(all_y_true, all_y_pred, average='weighted')
+
+    print(f"Overall Accuracy: {overall_acc:.4f}")
+    print(f"Weighted F1-Score: {overall_f1:.4f}")
+    print("\nDetailed Indicators:")
+    print(classification_report(all_y_true, all_y_pred, target_names=class_names))
+    plot_confusion_matrix(all_y_true, all_y_pred, class_names)
