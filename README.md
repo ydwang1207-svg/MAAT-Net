@@ -7,3 +7,5 @@ Code Usage Instructions:
 3、Run 2-class LOSO Validation to test the model's ASD screening performance.
 
 4、Run Baseline Model Compare to identify the advantages of MAAT-Net.
+
+The tobii.project file contains the data for this project. 
